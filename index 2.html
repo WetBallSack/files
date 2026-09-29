@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>文件下载</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      <h1 id="title">文件下载</h1>
+      <p class="sub" id="summary">正在加载文件列表…</p>
+    </header>
+
+    <label class="search">
+      <span class="sr-only">按文件名搜索</span>
+      <input id="q" type="search" placeholder="按文件名搜索" autocomplete="off">
+    </label>
+
+    <ul class="list" id="list" aria-live="polite"></ul>
+    <p class="empty" id="empty" hidden></p>
+  </main>
+
+  <script src="config.js"></script>
+  <script>
+  (() => {
+    const cfg = window.APP_CONFIG;
+    const $ = (id) => document.getElementById(id);
+    const FN = `${cfg.SUPABASE_URL}/functions/v1`;
+
+    // 旧版 anon key 是 JWT，需要同时放 Authorization；新版 publishable key 只放 apikey
+    const headers = { apikey: cfg.SUPABASE_ANON_KEY };
+    if (cfg.SUPABASE_ANON_KEY.startsWith("eyJ")) headers.Authorization = `Bearer ${cfg.SUPABASE_ANON_KEY}`;
+
+    document.title = cfg.SITE_TITLE;
+    $("title").textContent = cfg.SITE_TITLE;
+
+    let files = [];
+
+    const fmtSize = (b) => {
+      const u = ["B", "KB", "MB", "GB"];
+      let i = 0;
+      while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+      return i === 0 ? `${b} B` : `${b.toFixed(b < 100 ? 1 : 0)} ${u[i]}`;
+    };
+    const fmtDate = (iso) =>
+      new Date(iso).toLocaleDateString("zh-CN", { year: "numeric", month: "long", day: "numeric" });
+    const extOf = (name) => {
+      const m = name.match(/\.([a-z0-9]{1,5})$/i);
+      return m ? m[1].toUpperCase() : "FILE";
+    };
+
+    function rowFor(f) {
+      const li = document.createElement("li");
+      li.className = "row";
+
+      const tag = document.createElement("span");
+      tag.className = "tag";
+      tag.setAttribute("aria-hidden", "true");
+      tag.textContent = extOf(f.name);
+
+      const main = document.createElement("div");
+      main.className = "row-main";
+      const name = document.createElement("div");
+      name.className = "row-name";
+      name.textContent = f.name;
+      const meta = document.createElement("div");
+      meta.className = "row-meta";
+      const setMeta = () => {
+        meta.textContent = `${fmtSize(f.size)}，${fmtDate(f.created_at)} 上传，已下载 ${f.download_count} 次`;
+      };
+      setMeta();
+      main.append(name, meta);
+
+      const a = document.createElement("a");
+      a.className = "btn";
+      a.textContent = "下载";
+      a.href = `${FN}/download?id=${encodeURIComponent(f.id)}`;
+      a.setAttribute("aria-label", `下载 ${f.name}`);
+      a.addEventListener("click", () => { f.download_count++; setMeta(); });
+
+      li.append(tag, main, a);
+      return li;
+    }
+
+    function render() {
+      const raw = $("q").value.trim();
+      const q = raw.toLowerCase();
+      const shown = q ? files.filter((f) => f.name.toLowerCase().includes(q)) : files;
+      $("list").replaceChildren(...shown.map(rowFor));
+      $("empty").hidden = shown.length > 0;
+      $("empty").textContent = files.length === 0
+        ? "这里还没有文件。"
+        : `没有文件名包含「${raw}」的文件。`;
+    }
+
+    async function load() {
+      try {
+        const res = await fetch(
+          `${cfg.SUPABASE_URL}/rest/v1/files?select=id,name,size,download_count,created_at&order=created_at.desc`,
+          { headers }
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        files = await res.json();
+        const total = files.reduce((s, f) => s + f.size, 0);
+        $("summary").textContent = files.length
+          ? `共 ${files.length} 个文件，${fmtSize(total)}。点“下载”即可，不需要登录。`
+          : "点“下载”即可，不需要登录。";
+        render();
+      } catch {
+        $("summary").textContent = "文件列表没有加载出来。检查网络后刷新页面。";
+      }
+    }
+
+    $("q").addEventListener("input", render);
+    load();
+  })();
+  </script>
+</body>
+</html>

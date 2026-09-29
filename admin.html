@@ -1,0 +1,298 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex">
+  <title>管理文件</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="wrap">
+    <!-- 登录 -->
+    <section id="login" hidden>
+      <h1>管理员登录</h1>
+      <p class="sub">登录后可以上传和删除文件。</p>
+      <form id="loginForm" class="login">
+        <label class="field"><span>邮箱</span><input id="email" type="email" autocomplete="username" required></label>
+        <label class="field"><span>密码</span><input id="password" type="password" autocomplete="current-password" required></label>
+        <button class="btn" type="submit" id="loginBtn">登录</button>
+        <p class="msg" id="loginMsg" role="alert"></p>
+      </form>
+    </section>
+
+    <!-- 管理 -->
+    <section id="app" hidden>
+      <div class="topbar">
+        <div>
+          <h1>管理文件</h1>
+          <p class="sub" id="who"></p>
+        </div>
+        <div class="actions">
+          <a class="ghost" href="./" target="_blank" rel="noopener">打开下载页</a>
+          <button class="ghost" id="logout" type="button">退出登录</button>
+        </div>
+      </div>
+
+      <div class="meter">
+        <div class="meter-top"><span>存储空间</span><span id="meterText"></span></div>
+        <div class="meter-bar"><div class="meter-fill" id="meterFill"></div></div>
+      </div>
+
+      <label class="drop" id="drop">
+        <input id="picker" type="file" multiple class="sr-only">
+        <span>
+          <strong>选择文件上传</strong><br>
+          <span class="muted">也可以把文件拖到这里。单个文件最大 5 GB，上传完立刻出现在下载页。</span>
+        </span>
+      </label>
+      <p class="msg" id="upMsg" role="alert"></p>
+      <ul class="queue" id="queue"></ul>
+
+      <h2>已发布的文件</h2>
+      <ul class="list" id="list"></ul>
+      <p class="empty" id="empty" hidden>还没有文件。在上面选择文件上传。</p>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+  <script src="config.js"></script>
+  <script>
+  (() => {
+    const cfg = window.APP_CONFIG;
+    const $ = (id) => document.getElementById(id);
+    const FN = `${cfg.SUPABASE_URL}/functions/v1`;
+    const QUOTA = cfg.QUOTA_GB * 1024 ** 3;
+    const sb = window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY);
+
+    const fmtSize = (b) => {
+      const u = ["B", "KB", "MB", "GB"];
+      let i = 0;
+      while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+      return i === 0 ? `${b} B` : `${b.toFixed(b < 100 ? 1 : 0)} ${u[i]}`;
+    };
+    const fmtDate = (iso) =>
+      new Date(iso).toLocaleDateString("zh-CN", { year: "numeric", month: "long", day: "numeric" });
+    const extOf = (name) => {
+      const m = name.match(/\.([a-z0-9]{1,5})$/i);
+      return m ? m[1].toUpperCase() : "FILE";
+    };
+    const linkFor = (id) => `${FN}/download?id=${encodeURIComponent(id)}`;
+
+    // 调用 admin Edge Function，把服务端的中文错误信息取出来
+    async function call(action, payload = {}) {
+      const { data, error } = await sb.functions.invoke("admin", { body: { action, ...payload } });
+      if (error) {
+        let msg = error.message;
+        try { const j = await error.context.json(); if (j?.error) msg = j.error; } catch {}
+        throw new Error(msg);
+      }
+      return data;
+    }
+
+    // ---------- 登录状态 ----------
+    let signedInAs = null;
+    sb.auth.onAuthStateChange((_event, session) => {
+      const id = session?.user?.id ?? null;
+      $("login").hidden = !!session;
+      $("app").hidden = !session;
+      if (id && id !== signedInAs) {
+        $("who").textContent = `已登录：${session.user.email}`;
+        loadFiles();
+      }
+      signedInAs = id;
+    });
+
+    $("loginForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      $("loginMsg").textContent = "";
+      $("loginBtn").disabled = true;
+      const { error } = await sb.auth.signInWithPassword({
+        email: $("email").value.trim(),
+        password: $("password").value,
+      });
+      $("loginBtn").disabled = false;
+      if (error) {
+        $("loginMsg").textContent =
+          error.message === "Invalid login credentials" ? "邮箱或密码不对。" : error.message;
+      }
+    });
+    $("logout").addEventListener("click", () => sb.auth.signOut());
+
+    // ---------- 文件列表 ----------
+    let files = [];
+
+    async function loadFiles() {
+      const { data, error } = await sb
+        .from("files")
+        .select("id,name,size,download_count,created_at")
+        .order("created_at", { ascending: false });
+      if (error) { $("upMsg").textContent = `文件列表加载失败：${error.message}`; return; }
+      files = data;
+      renderFiles();
+    }
+
+    function renderFiles() {
+      const used = files.reduce((s, f) => s + f.size, 0);
+      const pct = Math.min(100, (used / QUOTA) * 100);
+      $("meterText").textContent = `${fmtSize(used)} / ${cfg.QUOTA_GB} GB`;
+      $("meterFill").style.width = `${pct}%`;
+      $("meterFill").classList.toggle("warn", pct > 90);
+      $("list").replaceChildren(...files.map(adminRow));
+      $("empty").hidden = files.length > 0;
+    }
+
+    function adminRow(f) {
+      const li = document.createElement("li");
+      li.className = "row";
+
+      const tag = document.createElement("span");
+      tag.className = "tag";
+      tag.setAttribute("aria-hidden", "true");
+      tag.textContent = extOf(f.name);
+
+      const main = document.createElement("div");
+      main.className = "row-main";
+      const name = document.createElement("div");
+      name.className = "row-name";
+      name.textContent = f.name;
+      const meta = document.createElement("div");
+      meta.className = "row-meta";
+      meta.textContent = `${fmtSize(f.size)}，${fmtDate(f.created_at)} 上传，已下载 ${f.download_count} 次`;
+      main.append(name, meta);
+
+      const actions = document.createElement("div");
+      actions.className = "actions";
+
+      const copy = document.createElement("button");
+      copy.type = "button";
+      copy.className = "ghost";
+      copy.textContent = "复制链接";
+      copy.addEventListener("click", async () => {
+        const link = linkFor(f.id);
+        try {
+          await navigator.clipboard.writeText(link);
+          copy.textContent = "已复制";
+          setTimeout(() => (copy.textContent = "复制链接"), 1500);
+        } catch {
+          prompt("复制这个下载链接：", link);
+        }
+      });
+
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "ghost danger";
+      del.textContent = "删除";
+      del.addEventListener("click", async () => {
+        if (!confirm(`删除「${f.name}」？它的下载链接会马上失效。`)) return;
+        del.disabled = true;
+        del.textContent = "删除中…";
+        try {
+          await call("delete", { id: f.id });
+          files = files.filter((x) => x.id !== f.id);
+          renderFiles();
+        } catch (e) {
+          alert(`删除失败：${e.message}`);
+          del.disabled = false;
+          del.textContent = "删除";
+        }
+      });
+
+      actions.append(copy, del);
+      li.append(tag, main, actions);
+      return li;
+    }
+
+    // ---------- 上传 ----------
+    const picker = $("picker");
+    const drop = $("drop");
+
+    window.addEventListener("dragover", (e) => e.preventDefault());
+    window.addEventListener("drop", (e) => e.preventDefault());
+    ["dragenter", "dragover"].forEach((t) =>
+      drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+    ["dragleave", "drop"].forEach((t) =>
+      drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+    drop.addEventListener("drop", (e) => enqueue([...e.dataTransfer.files]));
+    picker.addEventListener("change", () => { enqueue([...picker.files]); picker.value = ""; });
+
+    const pending = [];
+    let busy = false;
+
+    function enqueue(list) {
+      $("upMsg").textContent = "";
+      for (const file of list) pending.push({ file, ui: queueItem(file) });
+      if (!busy) run();
+    }
+
+    async function run() {
+      busy = true;
+      while (pending.length) {
+        const { file, ui } = pending.shift();
+        try { await uploadOne(file, ui); } catch (e) { ui.fail(e.message); }
+      }
+      busy = false;
+    }
+
+    function queueItem(file) {
+      const li = document.createElement("li");
+      li.className = "q";
+      const top = document.createElement("div");
+      top.className = "q-top";
+      const name = document.createElement("span");
+      name.className = "q-name";
+      name.textContent = file.name;
+      const status = document.createElement("span");
+      status.className = "q-status";
+      status.textContent = "排队中";
+      top.append(name, status);
+      const bar = document.createElement("div");
+      bar.className = "q-bar";
+      const fill = document.createElement("div");
+      fill.className = "q-fill";
+      bar.append(fill);
+      li.append(top, bar);
+      $("queue").prepend(li);
+      return {
+        status: (t) => (status.textContent = t),
+        progress: (p) => {
+          fill.style.width = `${(p * 100).toFixed(1)}%`;
+          status.textContent = `${Math.round(p * 100)}%`;
+        },
+        done: () => { li.classList.add("ok"); fill.style.width = "100%"; status.textContent = "已发布"; },
+        fail: (m) => { li.classList.add("err"); status.textContent = m; },
+      };
+    }
+
+    // 浏览器直传 B2，不经过 Edge Function，所以大文件也没问题
+    function putWithProgress(url, file, onProgress) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("PUT", url);
+        if (file.type) xhr.setRequestHeader("Content-Type", file.type);
+        xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+        xhr.onload = () =>
+          xhr.status >= 200 && xhr.status < 300
+            ? resolve()
+            : reject(new Error(`B2 拒绝了上传（HTTP ${xhr.status}）`));
+        xhr.onerror = () => reject(new Error("上传失败：网络中断，或 B2 的 CORS 没配好"));
+        xhr.send(file);
+      });
+    }
+
+    async function uploadOne(file, ui) {
+      if (file.size === 0) throw new Error("空文件，已跳过");
+      ui.status("准备上传");
+      const { key, uploadUrl } = await call("sign-upload", { name: file.name, size: file.size });
+      await putWithProgress(uploadUrl, file, ui.progress);
+      ui.status("登记中");
+      const { file: row } = await call("finalize", { key, name: file.name, contentType: file.type });
+      files.unshift(row);
+      renderFiles();
+      ui.done();
+    }
+  })();
+  </script>
+</body>
+</html>
